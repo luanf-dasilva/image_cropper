@@ -43,7 +43,7 @@ def interest_map(gray):
     imap = mag + 0.6 * lap
     imap = cv2.GaussianBlur(imap, (0, 0), 2)
 
-    # NEW: suppress flat/dark bands
+    # suppress flat/dark bands
     band_mask = mask_low_variance_bands(gray, min_run_frac=0.04, mean_thr=32, std_thr=14)
     imap = (imap * (band_mask.astype(np.float32) / 255.0))
 
@@ -81,12 +81,13 @@ def score_candidate(box, imap):
     + hard guards against skinny strips and weak center coverage.
     """
     import numpy as np
+    score = 0
     x, y, w, h = box
     H, W = imap.shape[:2]
 
     # --- hard rejections (generic, not app-specific) ---
     # Reject short bars (heights) and skinny vertical slices (width)
-    if h < H * 0.28 or w < W * 0.10:   # <- NEW min width rule (50% of image width)
+    if h < H * 0.28 or w < W * 0.10:   # <- min width rule (50% of image width)
         return -1e9
 
     roi = imap[y:y+h, x:x+w]
@@ -101,12 +102,14 @@ def score_candidate(box, imap):
     if overlap_area < 0.25 * (w * h):   # <- stricter center requirement
         return -1e6  # discourage heavily, but not absolute reject
 
+  
     # --- features ---
+    # input(f"roi.sum(): {roi.sum()}")
     interest_density = float(roi.sum()) / (w * h + 1e-6)
 
     # fullness: fraction of “interesting” pixels
     filled = float((roi > 32).mean())
-    if filled < 0.15:          # very flat = likely UI bar
+    if filled < 0.01: # very flat = likely UI bar
         return -1e9
 
     # centrality (closer to center is better)
@@ -124,13 +127,18 @@ def score_candidate(box, imap):
     var_global = max(1.0, float(np.var(imap)))
     var_factor = 0.5 + 0.5 * min(1.0, var_roi / (0.6 * var_global))  # 0.5..1
 
-    # --- area bonus (NEW): bigger boxes get a gentle boost ---
-    area_norm = (w * h) / float(W * H)              # 0..1
-    area_bonus = (0.5 + 0.5 * area_norm)            # 0.5..1
+    # --- bigger boxes get a gentle boost ---
+    area_norm = (w * h) / float(W * H)   # 0..1
+    area_bonus = (1.5 * area_norm)       # 0.5..1
 
     # --- final score ---
     base = interest_density * (0.7 + 0.25*centrality + 0.05*ar_penalty)
     score = base * (0.5 + filled) * var_factor * area_bonus
+
+    sq_pref = np.exp(-1.2 * abs(np.log(ar)))
+    score *= (0.3 + 0.7 * sq_pref)
+    # if w > 2 * h or h > 2 * w:
+    #     score -= score / 2
     return score
 
 def ocr_boxes(pil_img):
@@ -174,7 +182,10 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800):
     img_bgr = trim_uniform_borders(img_bgr, tol=2)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
     imap = interest_map(gray)
+    imap = cv2.normalize(imap, None, 0, 255, cv2.NORM_MINMAX)
+    imap = imap.astype("uint8")
 
     # candidates
     masks = candidate_masks(imap)
@@ -182,29 +193,34 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800):
     # plus full image fallback
     boxes.append((0, 0, imap.shape[1], imap.shape[0]))
 
-    # NEW: candidate from largest mid-tone region (inner card)
+    # candidate from largest mid-tone region (inner card)
     boxes.append(largest_content_box(gray))
     # score & pick
     scored = [(score_candidate(b, imap), b) for b in boxes]
     scored.sort(reverse=True, key=lambda t: t[0])
     best = scored[0][1]
-    # After computing imap:
-    cv2.imwrite("debug/debug_imap.png", imap)
+   
+    # after computing imap:
+    if args.debugp:
+        cv2.imwrite("debug/debug_imap.png", imap)
 
-    # Dump each candidate box and its score:
+    # dump each candidate box and its score:
     for s, b in scored:
         x,y,w,h = b
         vis = cv2.cvtColor(imap, cv2.COLOR_GRAY2BGR).copy()
         cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
         cv2.putText(vis, f"{s:.2f}", (x+5,y+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        cv2.imwrite(f"debug/debug_candidate_{x}_{y}_{w}_{h}_{s:.2f}.png", vis)
+        if args.debugp:
+            cv2.imwrite(f"debug/debug_candidate_{x}_{y}_{w}_{h}_{s:.2f}.png", vis)
         # expand to include text (optional, safe fallback)
+
     if keep_text:
         pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
         tboxes = ocr_boxes(pil)
         best = expand_for_text(best, tboxes, pad=24, W=imap.shape[1], H=imap.shape[0])
 
     x, y, w, h = best
+    print("best: ", x, y, w, h)
     crop = img_bgr[y:y+h, x:x+w]
 
     # mild enhancement (generic, not artsy)
@@ -301,6 +317,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=False, default=None, help="input file or folder")
     ap.add_argument("--out", dest="outp", required=False, default="./out", help="output file or folder")
+    ap.add_argument("--debug", dest="debugp", required=False, default=False, help="print candidate debug boxes")
+
     args = ap.parse_args()
 
     if args.inp is None:
