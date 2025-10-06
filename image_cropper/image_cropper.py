@@ -67,6 +67,68 @@ def candidate_masks(imap):
         masks.append(m)
     return masks
 
+def bottom_text_band_mask(gray):
+    """
+    Heuristic: detect bottom caption/controls — thin horizontal strokes on dark bg.
+    Returns a 0/1 mask (uint8) same size as gray.
+    """
+    import numpy as np, cv2
+    H, W = gray.shape
+    g = cv2.GaussianBlur(gray, (0,0), 1.2)
+    edges = cv2.Canny(g, 60, 120)
+
+    # emphasize horizontal text strokes
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (9,1))
+    horiz = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=1)
+
+    # focus on bottom third where IG puts captions/controls
+    mask = np.zeros_like(horiz)
+    mask[int(H*0.60):] = horiz[int(H*0.60):]
+    # thicken a little so overlap test is stable
+    mask = cv2.dilate(mask, np.ones((3,3), np.uint8), 1)
+    return (mask > 0).astype(np.uint8)
+
+
+def box_from_row_energy(imap, min_h_frac=0.35, gap=8):
+    """
+    Use row-wise energy to pick the main content band (top..bottom),
+    ignoring short low-energy dips (gap). Returns (x,y,w,h).
+    """
+    import numpy as np, cv2
+    H, W = imap.shape
+    row_e = imap.mean(axis=1)                   # energy per row
+    # smooth a bit
+    row_e = cv2.GaussianBlur(row_e.astype(np.float32), (0,0), 3)
+
+    # threshold relative to the 70th percentile (robust on dark UIs)
+    thr = np.percentile(row_e, 70)
+    on = (row_e >= thr).astype(np.uint8)
+
+    # close small gaps so a short caption line doesn't split the band
+    kernel = np.ones(gap, np.uint8)
+    on = cv2.morphologyEx(on[None, :], cv2.MORPH_CLOSE, kernel)[0]
+
+    # pick longest run of "on"
+    best = (0, 0)  # (start, end)
+    i = 0
+    while i < H:
+        if on[i]:
+            j = i
+            while j < H and on[j]: j += 1
+            if j - i > best[1] - best[0]:
+                best = (i, j)
+            i = j
+        else:
+            i += 1
+
+    y1, y2 = best
+    if y2 - y1 < int(H * min_h_frac):
+        # fallback: keep most of the center, this shouldn't happen often
+        y1, y2 = int(H*0.12), int(H*0.88)
+
+    # left/right: keep almost all (let scorer/AR handle vertical bars)
+    return (int(W*0.04), int(y1), int(W*0.92), int(y2 - y1))
+
 def box_from_mask(mask):
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
@@ -75,7 +137,7 @@ def box_from_mask(mask):
     y1, y2 = ys.min(), ys.max()
     return (x1, y1, x2 - x1 + 1, y2 - y1 + 1)
 
-def score_candidate(box, imap):
+def score_candidate(box, imap, btm_mask):
     """
     Score = interest density * (center + aspect) * fullness * variance * area bonus
     + hard guards against skinny strips and weak center coverage.
@@ -137,8 +199,12 @@ def score_candidate(box, imap):
 
     sq_pref = np.exp(-1.2 * abs(np.log(ar)))
     score *= (0.3 + 0.7 * sq_pref)
-    # if w > 2 * h or h > 2 * w:
-    #     score -= score / 2
+    bx, by, bw, bh = box
+    band = btm_mask[by:by+bh, bx:bx+bw]
+    if band.size:
+        overlap = band.mean()           # 0..1 fraction of pixels touching caption strokes
+        score *= (1.0 - 0.6 * overlap)  # up to 60% downweight if it sits on the caption
+    if w > 2 * h or h > 2 * w: score = score / 10  # input(score) return score   
     return score
 
 def ocr_boxes(pil_img):
@@ -170,8 +236,9 @@ def expand_for_text(box, boxes, pad, W, H):
     x2 = min(W - 1, x2); y2 = min(H - 1, y2)
     return (x1, y1, x2 - x1, y2 - y1)
 
+
 # ---------- main pipeline ----------
-def auto_crop(img_bgr, keep_text=True, target_max=1800):
+def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return_conf=False):
     # normalize size
     H0, W0 = img_bgr.shape[:2]
     scale = min(1.0, float(target_max) / max(H0, W0))
@@ -190,51 +257,53 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800):
     # candidates
     masks = candidate_masks(imap)
     boxes = [box_from_mask(m) for m in masks]
-    # plus full image fallback
     boxes.append((0, 0, imap.shape[1], imap.shape[0]))
-
-    # candidate from largest mid-tone region (inner card)
     boxes.append(largest_content_box(gray))
+    # (if you added row-energy candidate, add it here too)
+
     # score & pick
-    scored = [(score_candidate(b, imap), b) for b in boxes]
-    scored.sort(reverse=True, key=lambda t: t[0])
-    best = scored[0][1]
-   
-    # after computing imap:
-    if args.debugp:
-        cv2.imwrite("debug/debug_imap.png", imap)
+    btm_mask = mask_low_variance_bands(gray)
+    scored = [(score_candidate(b, imap, btm_mask), b) for b in boxes]
 
-    # dump each candidate box and its score:
-    for s, b in scored:
-        x,y,w,h = b
-        vis = cv2.cvtColor(imap, cv2.COLOR_GRAY2BGR).copy()
-        cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
-        cv2.putText(vis, f"{s:.2f}", (x+5,y+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        if args.debugp:
-            cv2.imwrite(f"debug/debug_candidate_{x}_{y}_{w}_{h}_{s:.2f}.png", vis)
-        # expand to include text (optional, safe fallback)
+    # keep only "valid" ones for margin calc (drop the huge negative sentinels)
+    valid = [(s, b) for (s, b) in scored if s > -1e5]
+    if not valid:  # fallback if everything was nuked
+        valid = scored
 
-    if keep_text:
-        pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-        tboxes = ocr_boxes(pil)
-        best = expand_for_text(best, tboxes, pad=24, W=imap.shape[1], H=imap.shape[0])
+    valid.sort(key=lambda t: t[0], reverse=True)
+    best_score, best = valid[0]
+    second = valid[1][0] if len(valid) > 1 else (best_score - 1.0)
 
+    # confidence from score margin (squashed to 0..1)
+    # larger margin => more confident
+    import math
+    margin = best_score - second
+    conf = 1.0 / (1.0 + math.exp(-margin / (abs(best_score) + 1e-6)))  # sigmoid
+
+    # (you can also clip conf if area is tiny or AR extreme)
     x, y, w, h = best
-    print("best: ", x, y, w, h)
     crop = img_bgr[y:y+h, x:x+w]
 
-    # mild enhancement (generic, not artsy)
+    # mild enhancement
     crop = cv2.GaussianBlur(crop, (0,0), 0.5)
     crop = cv2.addWeighted(crop, 1.15, cv2.GaussianBlur(crop, (0,0), 2), -0.15, 0)
 
+    if return_box or return_conf:
+        out = []
+        if return_box:  out.append((x, y, w, h))
+        if return_conf: out.append(float(conf))
+        if len(out) == 1: return out[0]  # keep backward-compat
+        return tuple(out) + (crop,) if not return_box else ( (x,y,w,h), crop, float(conf) )
+
     return crop
 
-def process_path(in_path, out_path):
+
+def process_path(in_path, out_path, debug=False):
     img = cv2.imread(in_path)
     if img is None:
         print(f"❌ Could not read {in_path}")
         return
-    crop = auto_crop(img, keep_text=True)
+    crop = auto_crop(img, keep_text=True, debug=debug)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, crop)
     print(f"✅ {out_path}")
@@ -320,7 +389,7 @@ if __name__ == "__main__":
     ap.add_argument("--debug", dest="debugp", required=False, default=False, help="print candidate debug boxes")
 
     args = ap.parse_args()
-
+    debug = args.debugp
     if args.inp is None:
         print("Usage:\n  python autocrop.py --in ./raw --out ./clean")
         raise SystemExit(1)
@@ -331,13 +400,14 @@ if __name__ == "__main__":
     exts = {".jpg",".jpeg",".png",".bmp",".webp"}
     if p_in.is_dir():
         for f in sorted(p_in.rglob("*")):
+            print(f)
             if f.suffix.lower() in exts:
                 rel = f.relative_to(p_in)
                 out_f = p_out / rel
-                process_path(str(f), str(out_f))
+                process_path(str(f), str(out_f), debug=debug)
     else:
         if p_out.is_dir():
             out_f = p_out / pathlib.Path(args.inp).name
         else:
             out_f = p_out
-        process_path(str(p_in), str(out_f))
+        process_path(str(p_in), str(out_f), debug=debug)

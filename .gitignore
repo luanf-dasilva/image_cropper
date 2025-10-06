@@ -1,4 +1,15 @@
-*debug*
 .Pipfile.lock
+
+*debug*
 *out*
 *debug*
+*errors/*
+*train/*
+*val/*
+*labels/*
+*images/*
+*review/*
+*previews/*
+
+labels.csv
+data.yaml
