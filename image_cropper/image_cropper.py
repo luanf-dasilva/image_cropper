@@ -204,7 +204,7 @@ def score_candidate(box, imap, btm_mask):
     if band.size:
         overlap = band.mean()           # 0..1 fraction of pixels touching caption strokes
         score *= (1.0 - 0.6 * overlap)  # up to 60% downweight if it sits on the caption
-    if w > 2 * h or h > 2 * w: score = score / 10  # input(score) return score   
+    # if w > 2 * h or h > 2 * w: score = score / 10  # input(score) return score   
     return score
 
 def ocr_boxes(pil_img):
@@ -294,16 +294,27 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return
         if return_conf: out.append(float(conf))
         if len(out) == 1: return out[0]  # keep backward-compat
         return tuple(out) + (crop,) if not return_box else ( (x,y,w,h), crop, float(conf) )
+    # after computing imap:
+    if args.debugp:
+        cv2.imwrite("debug/debug_imap.png", imap)
 
+        # dump each candidate box and its score:
+        for s, b in scored:
+            x,y,w,h = b
+            vis = cv2.cvtColor(imap, cv2.COLOR_GRAY2BGR).copy()
+            cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
+            cv2.putText(vis, f"{s:.2f}", (x+5,y+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            if args.debugp:
+                cv2.imwrite(f"debug/debug_candidate_{x}_{y}_{w}_{h}_{s:.2f}.png", vis)
     return crop
 
 
-def process_path(in_path, out_path, debug=False):
+def process_path(in_path, out_path):
     img = cv2.imread(in_path)
     if img is None:
         print(f"❌ Could not read {in_path}")
         return
-    crop = auto_crop(img, keep_text=True, debug=debug)
+    crop = auto_crop(img, keep_text=True)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, crop)
     print(f"✅ {out_path}")
@@ -404,10 +415,10 @@ if __name__ == "__main__":
             if f.suffix.lower() in exts:
                 rel = f.relative_to(p_in)
                 out_f = p_out / rel
-                process_path(str(f), str(out_f), debug=debug)
+                process_path(str(f), str(out_f))
     else:
         if p_out.is_dir():
             out_f = p_out / pathlib.Path(args.inp).name
         else:
             out_f = p_out
-        process_path(str(p_in), str(out_f), debug=debug)
+        process_path(str(p_in), str(out_f))

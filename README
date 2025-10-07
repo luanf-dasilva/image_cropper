@@ -1,0 +1,17 @@
+image_cropper
+    heuristic model for cropping images
+    - image_cropper.py         
+        main cropping script
+        usage: python image_cropper.py --out [output_dir]  --in <input_image_path_or_dir>  [--debug any_t]
+    - heuristic_to_yolo.py     
+        use image_cropper.py to generate yolo format labels from images
+        usage: python heuristic_to_yolo.py --src <src_dir> [--dst <dst_dir>]
+    - cleanup_dataset.py       
+        cleanup script for removing bad images from ai dataset
+        usage: python cleanup_dataset.py [--dry-run] >]
+
+aimage_cropper
+    use AI model for image cropping on set of labeled images
+    - aimage_cropper.py        
+        main cropping script
+    - 
