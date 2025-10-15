@@ -60,7 +60,7 @@ def main():
                 raise ValueError("cv2.imread returned None")
             H,W = img.shape[:2]
 
-            box, _crop, conf = auto_crop(img, return_box=True, return_conf=True)
+            box, _crop, conf = auto_crop(img, return_box=True, return_conf=True, debug=False)
             af = area_frac(box, W, H)
 
             # skip implausible boxes (still counts as error)

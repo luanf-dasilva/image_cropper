@@ -1,10 +1,11 @@
 # pip install opencv-python pillow
 # (optional) pip install pytesseract  and install Tesseract binary for OCR
 
-import os, glob
+import os
 import numpy as np
 import cv2
 from PIL import Image
+import re
 
 # ---- Optional OCR (safe fallback) ----
 try:
@@ -137,7 +138,7 @@ def box_from_mask(mask):
     y1, y2 = ys.min(), ys.max()
     return (x1, y1, x2 - x1 + 1, y2 - y1 + 1)
 
-def score_candidate(box, imap, btm_mask):
+def score_candidate(box, imap, btm_mask, debug=False):
     """
     Score = interest density * (center + aspect) * fullness * variance * area bonus
     + hard guards against skinny strips and weak center coverage.
@@ -162,7 +163,7 @@ def score_candidate(box, imap, btm_mask):
     overlap_h = max(0, min(y+h, cy2) - max(y, cy1))
     overlap_area = overlap_w * overlap_h
     if overlap_area < 0.25 * (w * h):   # <- stricter center requirement
-        return -1e6  # discourage heavily, but not absolute reject
+        score = -1e6  # discourage heavily, but not absolute reject
 
   
     # --- features ---
@@ -172,7 +173,7 @@ def score_candidate(box, imap, btm_mask):
     # fullness: fraction of “interesting” pixels
     filled = float((roi > 32).mean())
     if filled < 0.01: # very flat = likely UI bar
-        return -1e9
+        score = -1e9
 
     # centrality (closer to center is better)
     cx, cy = x + w/2.0, y + h/2.0
@@ -204,8 +205,19 @@ def score_candidate(box, imap, btm_mask):
     if band.size:
         overlap = band.mean()           # 0..1 fraction of pixels touching caption strokes
         score *= (1.0 - 0.6 * overlap)  # up to 60% downweight if it sits on the caption
-    # if w > 2 * h or h > 2 * w: score = score / 10  # input(score) return score   
+    if w > 2 * h or h > 2 * w: 
+        score = score - (abs(score) / 2)  # input(score) return score
+    if debug:
+        print(f"box: {box}\nscore: {score}\nbase: {base}\nfilled: {filled}\nvar_factor: {var_factor}\narea_bonus: {area_bonus}\nsq_pref: {sq_pref}\noverlap: {overlap}\ncentrality: {centrality}\nar_penalty: {ar_penalty}\n\n")
     return score
+
+STOPWORDS = {
+    "follow","sponsored","likes","like","comments","comment",
+    "view","views","reply","replies","share","send","save",
+    "instagram","post","minutes","minute","mins","min","hours","hour",
+    "days","day","ago","•","…", "suggested", "posts", 
+}
+NUM_RE = re.compile(r"^(?:[\d,\.]+[kKmM]?|\d{1,2}:\d{2}(?:\s?[ap]m)?)$")
 
 def ocr_boxes(pil_img):
     if not TESS_OK:
@@ -214,31 +226,112 @@ def ocr_boxes(pil_img):
         d = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
         out = []
         for i in range(len(d['text'])):
-            if str(d['text'][i]).strip() and int(d.get('conf', ['0'])[i]) > 50:
-                out.append((d['left'][i], d['top'][i], d['width'][i], d['height'][i]))
+            txt = (d['text'][i] or "").strip()
+            if not txt: 
+                continue
+            conf = int(d.get('conf', ['0'])[i])
+            if conf < 55: 
+                continue
+            low = txt.lower()
+
+            # hard text filters
+            if low in STOPWORDS: 
+                continue
+            if NUM_RE.match(low): 
+                continue
+            if low.startswith('@'): 
+                continue  # usernames
+            if low == "follow": 
+                continue
+            # print(d['text'][i])
+            # input((d['left'][i], d['top'][i], d['width'][i], d['height'][i], low))
+            out.append( (d['left'][i], d['top'][i], d['width'][i], d['height'][i], low) )
         return out
     except Exception:
         return []
 
-def expand_for_text(box, boxes, pad, W, H):
-    if not boxes:
-        return box
-    x, y, w, h = box
+def ig_ui_exclusion_mask(gray):
+    """
+    Rough IG layout mask: mark header, footer nav, and caption band as EXCLUDED (1s).
+    Return uint8 mask 0/255 where 255 = excluded UI area to ignore.
+    """
+    H, W = gray.shape
+    mask = np.zeros_like(gray, dtype=np.uint8)
+
+    # Header (clock + "Instagram" + story row)
+    h_header = int(H * 0.14)   # 12–16% is typical, keep a little slack
+    mask[:h_header, :] = 255
+
+    # Footer nav (home/search/plus/reels/profile)
+    h_footer = int(H * 0.12)
+    mask[H - h_footer:, :] = 255
+
+    # Caption/like bar usually starts above footer; mark a band above footer
+    # (this also catches "View all comments", counts, time-ago)
+    cap_top = max(0, H - int(H * 0.30))
+    cap_bot = H - int(H * 0.12)
+    mask[cap_top:cap_bot, :] = np.maximum(mask[cap_top:cap_bot, :], 255)
+
+    # Optional: left strip where avatar/username sits on feed
+    mask[:, :int(W * 0.07)] = 255
+
+    # Slight dilation so we don't hug edges
+    mask = cv2.dilate(mask, np.ones((7,7), np.uint8), 1)
+    return mask
+
+def expand_for_text(best_box, ocr_items, pad, W, H, ui_excl_mask, near_factor=1.1):
+    """
+    Expand best_box to include OCR boxes that are:
+      - mostly outside excluded UI mask
+      - reasonably near the best box (limits grabbing header/caption far away)
+    ocr_items: list of (x,y,w,h,text_low)
+    """
+    if not ocr_items: 
+        return best_box
+
+    x, y, w, h = best_box
     x1, y1, x2, y2 = x, y, x + w, y + h
-    for (bx, by, bw, bh) in boxes:
-        bx2, by2 = bx + bw, by + bh
-        if not (bx2 < x1 - pad or bx > x2 + pad or by2 < y1 - pad or by > y2 + pad):
-            x1 = min(x1, bx - pad)
-            y1 = min(y1, by - pad)
-            x2 = max(x2, bx2 + pad)
-            y2 = max(y2, by2 + pad)
+
+    # a slightly grown region around the best box
+    grow_w = int(w * (near_factor - 1.0) / 2.0)
+    grow_h = int(h * (near_factor - 1.0) / 2.0)
+    near_x1 = max(0, x1 - grow_w)
+    near_y1 = max(0, y1 - grow_h)
+    near_x2 = min(W - 1, x2 + grow_w)
+    near_y2 = min(H - 1, y2 + grow_h)
+
+    for (bx, by, bw, bh, _txt) in ocr_items:
+        # skip if mostly inside UI excluded zones
+        bmask = ui_excl_mask[by:by+bh, bx:bx+bw]
+        if bmask.size and (bmask.mean() > 128):   # majority masked
+            continue
+
+        # require it to be near the main crop
+        if bx + bw < near_x1 or bx > near_x2 or by + bh < near_y1 or by > near_y2:
+            continue
+
+        # expand but only OUTWARD (don’t jump into header/footer)
+        x1 = min(x1, bx - pad)
+        y1 = min(y1, by - pad)
+        x2 = max(x2, bx + bw + pad)
+        y2 = max(y2, by + bh + pad)
+
+    # clip and also keep away from excluded regions by 2px
     x1 = max(0, x1); y1 = max(0, y1)
     x2 = min(W - 1, x2); y2 = min(H - 1, y2)
+
+    # shave off any overlap with UI mask at the very edges
+    # (prevents expansion up into "Follow" or down into likes row)
+    while y1 > 0 and ui_excl_mask[y1:y1+2, x1:x2].mean() > 128: y1 += 2
+    while y2 < H-1 and ui_excl_mask[y2-2:y2, x1:x2].mean() > 128: y2 -= 2
+    while x1 > 0 and ui_excl_mask[y1:y2, x1:x1+2].mean() > 128: x1 += 2
+    while x2 < W-1 and ui_excl_mask[y1:y2, x2-2:x2].mean() > 128: x2 -= 2
+
+    x1 = max(0, min(x1, x2-1))
+    y1 = max(0, min(y1, y2-1))
     return (x1, y1, x2 - x1, y2 - y1)
-
-
 # ---------- main pipeline ----------
-def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return_conf=False):
+def auto_crop(img_bgr, target_max=1800, return_box=False, return_conf=False, debug=False):
     # normalize size
     H0, W0 = img_bgr.shape[:2]
     scale = min(1.0, float(target_max) / max(H0, W0))
@@ -263,7 +356,7 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return
 
     # score & pick
     btm_mask = mask_low_variance_bands(gray)
-    scored = [(score_candidate(b, imap, btm_mask), b) for b in boxes]
+    scored = [(score_candidate(b, imap, btm_mask, debug), b) for b in boxes]
 
     # keep only "valid" ones for margin calc (drop the huge negative sentinels)
     valid = [(s, b) for (s, b) in scored if s > -1e5]
@@ -280,6 +373,12 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return
     margin = best_score - second
     conf = 1.0 / (1.0 + math.exp(-margin / (abs(best_score) + 1e-6)))  # sigmoid
 
+    # expand for text around crop
+    ui_mask = ig_ui_exclusion_mask(gray)
+    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    tboxes = ocr_boxes(pil) 
+    best = expand_for_text(best, tboxes, pad=60, W=imap.shape[1], H=imap.shape[0],
+                       ui_excl_mask=ui_mask, near_factor=1.15)
     # (you can also clip conf if area is tiny or AR extreme)
     x, y, w, h = best
     crop = img_bgr[y:y+h, x:x+w]
@@ -295,7 +394,7 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return
         if len(out) == 1: return out[0]  # keep backward-compat
         return tuple(out) + (crop,) if not return_box else ( (x,y,w,h), crop, float(conf) )
     # after computing imap:
-    if args.debugp:
+    if debug:
         cv2.imwrite("debug/debug_imap.png", imap)
 
         # dump each candidate box and its score:
@@ -304,17 +403,16 @@ def auto_crop(img_bgr, keep_text=True, target_max=1800, return_box=False, return
             vis = cv2.cvtColor(imap, cv2.COLOR_GRAY2BGR).copy()
             cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
             cv2.putText(vis, f"{s:.2f}", (x+5,y+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-            if args.debugp:
+            if debug:
                 cv2.imwrite(f"debug/debug_candidate_{x}_{y}_{w}_{h}_{s:.2f}.png", vis)
     return crop
-
 
 def process_path(in_path, out_path):
     img = cv2.imread(in_path)
     if img is None:
         print(f"❌ Could not read {in_path}")
         return
-    crop = auto_crop(img, keep_text=True)
+    crop = auto_crop(img, debug=debug)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, crop)
     print(f"✅ {out_path}")
