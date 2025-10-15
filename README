@@ -9,6 +9,9 @@ image_cropper
     - cleanup_dataset.py       
         cleanup script for removing bad images from ai dataset
         usage: python cleanup_dataset.py [--dry-run] >]
+    - manual_cropper.py        
+        manual cropping script
+        usage: python manual_cropper.py --src <src_dir> [--dst <dst_dir>]
 
 aimage_cropper
     use AI model for image cropping on set of labeled images
