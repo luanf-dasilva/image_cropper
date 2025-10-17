@@ -10,6 +10,7 @@
 *images/*
 *review/*
 *previews/*
+*raw_images/*
 
 labels.csv
 data.yaml
