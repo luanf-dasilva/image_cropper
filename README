@@ -14,7 +14,28 @@ image_cropper
         usage: python manual_cropper.py --src <src_dir> [--dst <dst_dir>]
 
 aimage_cropper
+
+    notes on using yolo:
+
+    check if CUDA available via cmd line:
+        python - <<'PY'
+        import torch
+        print("CUDA available:", torch.cuda.is_available())
+        if torch.cuda.is_available():
+            print("GPU name:", torch.cuda.get_device_name(0))
+        PY
+    
+    train model (with nano yolo model):
+        yolo detect train model=yolov8n.pt data=aimage_cropper/dataset/data.yml device=0 epochs=30 imgsz=640 batch=-1
+
+    sanity check validation:
+        yolo detect val   model=./runs/detect/train3/weights/best.pt  data=aimage_cropper/dataset/data.yml imgsz=896
+
+
     use AI model for image cropping on set of labeled images
     - aimage_cropper.py        
-        main cropping script
-    - 
+        runs cropping on set of labeled images with some pretrained model
+        usage:
+        python yolo_autocrop.py --model runs/detect/train/weights/best.pt --src "C:\pics" --dst "./autocrops"
+        python yolo_autocrop.py --model best.pt --src ./raw --dst ./out --conf 0.2 --iou 0.6 --imgsz 640 --pad 0.03 --device 0
+        python yolo_autocrop.py --model best.pt --src ./raw --dst ./out --on-miss skip --flatten --overwrite
